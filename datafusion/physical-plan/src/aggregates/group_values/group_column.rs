@@ -22,6 +22,7 @@ use arrow::array::GenericBinaryArray;
 use arrow::array::GenericStringArray;
 use arrow::array::OffsetSizeTrait;
 use arrow::array::PrimitiveArray;
+use arrow::array::PrimitiveBuilder;
 use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::buffer::ScalarBuffer;
@@ -32,6 +33,8 @@ use arrow::datatypes::GenericBinaryType;
 use arrow_array::GenericByteArray;
 use arrow_array::GenericByteViewArray;
 use arrow_buffer::Buffer;
+use arrow_ord::cmp::eq;
+use arrow_ord::cmp::not_distinct;
 use datafusion_common::utils::proxy::VecAllocExt;
 use itertools::izip;
 
@@ -166,31 +169,41 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
     ) {
         let array = array.as_primitive::<T>();
 
-        let iter = izip!(
-            lhs_rows.iter(),
-            rhs_rows.iter(),
-            equal_to_results.iter_mut(),
-        );
+        let arr_left = {
+            let mut builder_left = PrimitiveBuilder::<T>::with_capacity(lhs_rows.len());
+            lhs_rows.iter().for_each(|idx| {
+                if self.nulls.is_null(*idx) {
+                    builder_left.append_null();
+                } else {
+                    builder_left.append_value(self.group_values[*idx]);
+                }   
+            });
+            builder_left.finish()
+        };
 
-        for (&lhs_row, &rhs_row, equal_to_result) in iter {
-            // Has found not equal to in previous column, don't need to check
-            if !*equal_to_result {
-                continue;
-            }
-
-            // Perf: skip null check (by short circuit) if input is not nullable
-            if NULLABLE {
-                let exist_null = self.nulls.is_null(lhs_row);
-                let input_null = array.is_null(rhs_row);
-                if let Some(result) = nulls_equal_to(exist_null, input_null) {
-                    *equal_to_result = result;
-                    continue;
+        let arr_right = {
+            let mut builder_right = PrimitiveBuilder::<T>::with_capacity(rhs_rows.len());
+            rhs_rows.iter().for_each(|idx| {
+                if array.is_null(*idx) {
+                    builder_right.append_null();
+                } else {
+                    builder_right.append_value(array.value(*idx));
                 }
-                // Otherwise, we need to check their values
-            }
+            });
+            builder_right.finish()
+        };
 
-            *equal_to_result = self.group_values[lhs_row] == array.value(rhs_row);
-        }
+        let equal_arr = match NULLABLE {
+            true => not_distinct(&arr_left, &arr_right),
+            false => eq(&arr_left, &arr_right),
+        }.unwrap();
+        
+        equal_arr.iter().enumerate().for_each(|(idx, eq)| {
+            match eq {
+                Some(eq) => equal_to_results[idx] = eq,
+                None => unreachable!()
+            }
+        })
     }
 
     fn vectorized_append(&mut self, array: &ArrayRef, rows: &[usize]) {
