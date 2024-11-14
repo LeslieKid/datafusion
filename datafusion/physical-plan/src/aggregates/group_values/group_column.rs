@@ -169,29 +169,36 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
     ) {
         let array = array.as_primitive::<T>();
 
-        let arr_left = {
-            let mut builder_left = PrimitiveBuilder::<T>::with_capacity(lhs_rows.len());
-            lhs_rows.iter().for_each(|idx| {
-                if self.nulls.is_null(*idx) {
-                    builder_left.append_null();
-                } else {
-                    builder_left.append_value(self.group_values[*idx]);
-                }   
-            });
-            builder_left.finish()
-        };
+        // FIXME: The initial capacity here may lead to a waste of memory.
+        let mut builder_left = PrimitiveBuilder::<T>::with_capacity(lhs_rows.len());
+        let mut builder_right = PrimitiveBuilder::<T>::with_capacity(rhs_rows.len());
 
-        let arr_right = {
-            let mut builder_right = PrimitiveBuilder::<T>::with_capacity(rhs_rows.len());
-            rhs_rows.iter().for_each(|idx| {
-                if array.is_null(*idx) {
-                    builder_right.append_null();
-                } else {
-                    builder_right.append_value(array.value(*idx));
-                }
-            });
-            builder_right.finish()
-        };
+        let iter = izip!(
+            lhs_rows.iter(),
+            rhs_rows.iter(),
+            equal_to_results.iter(),
+        );
+
+        for (idx_left, idx_right, is_valid) in iter {
+            if !*is_valid {
+                continue;
+            }
+
+            if self.nulls.is_null(*idx_left) {
+                builder_left.append_null();
+            } else {
+                builder_left.append_value(self.group_values[*idx_left]);
+            }
+
+            if array.is_null(*idx_right) {
+                builder_right.append_null();
+            } else {
+                builder_right.append_value(array.value(*idx_right));
+            }
+        }
+
+        let arr_left = builder_left.finish();
+        let arr_right = builder_right.finish();
 
         let equal_arr = match NULLABLE {
             true => not_distinct(&arr_left, &arr_right),
