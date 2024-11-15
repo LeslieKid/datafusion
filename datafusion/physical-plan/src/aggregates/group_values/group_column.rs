@@ -36,8 +36,6 @@ use arrow_buffer::BooleanBuffer;
 use arrow_buffer::Buffer;
 use arrow_buffer::MutableBuffer;
 use arrow_buffer::NullBuffer;
-use arrow_ord::cmp::eq;
-use arrow_ord::cmp::not_distinct;
 use datafusion_common::utils::proxy::VecAllocExt;
 use itertools::izip;
 
@@ -232,17 +230,34 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
             PrimitiveArray::new(values_buf, nulls)
         };
 
-        let equal_arr = match NULLABLE {
-            true => not_distinct(&arr_left, &arr_right),
-            false => eq(&arr_left, &arr_right),
-        }.unwrap();
-        
-        equal_arr.iter().enumerate().for_each(|(idx, eq)| {
-            match eq {
-                Some(eq) => equal_to_results[idx] = eq,
-                None => unreachable!()
+        let equal_arr: BooleanBuffer = match NULLABLE {
+            true => {
+                let equal_values: BooleanBuffer = (0..lhs_rows.len())
+                    .map(|idx| arr_left.value(idx) == arr_right.value(idx))
+                    .collect();
+                match (arr_left.nulls(), arr_right.nulls()) {
+                    (Some(nulls_left), Some(nulls_right)) => {
+                        let equal_nulls_or = !&(nulls_left.inner() | nulls_right.inner());
+                        let equal_nulls_xor = !&(nulls_left.inner() ^ nulls_right.inner());
+
+                        &(((&equal_nulls_or) | (&equal_values))) & (&equal_nulls_xor)
+                    }
+                    (Some(equal_nulls), None) | (None, Some(equal_nulls)) => {
+                        equal_nulls.inner() & (&equal_values)
+                    }
+                    (None, None) => equal_values,
+                }
             }
-        })
+            false => {
+                (0..lhs_rows.len())
+                .map(|idx| arr_left.value(idx) == arr_right.value(idx))
+                .collect()
+            }
+        };
+
+        equal_arr.iter().enumerate().for_each(|(idx, eq)| {
+            equal_to_results[idx] &= eq;
+        });
     }
 
     fn vectorized_append(&mut self, array: &ArrayRef, rows: &[usize]) {
