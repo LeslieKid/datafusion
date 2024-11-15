@@ -22,7 +22,6 @@ use arrow::array::GenericBinaryArray;
 use arrow::array::GenericStringArray;
 use arrow::array::OffsetSizeTrait;
 use arrow::array::PrimitiveArray;
-use arrow::array::PrimitiveBuilder;
 use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::buffer::ScalarBuffer;
@@ -32,7 +31,11 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::GenericBinaryType;
 use arrow_array::GenericByteArray;
 use arrow_array::GenericByteViewArray;
+use arrow_buffer::bit_util;
+use arrow_buffer::BooleanBuffer;
 use arrow_buffer::Buffer;
+use arrow_buffer::MutableBuffer;
+use arrow_buffer::NullBuffer;
 use arrow_ord::cmp::eq;
 use arrow_ord::cmp::not_distinct;
 use datafusion_common::utils::proxy::VecAllocExt;
@@ -169,36 +172,65 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
     ) {
         let array = array.as_primitive::<T>();
 
-        // FIXME: The initial capacity here may lead to a waste of memory.
-        let mut builder_left = PrimitiveBuilder::<T>::with_capacity(lhs_rows.len());
-        let mut builder_right = PrimitiveBuilder::<T>::with_capacity(rhs_rows.len());
+        let arr_left: PrimitiveArray<T> = {
+            let values_buf: ScalarBuffer<T::Native> = lhs_rows
+                .iter()
+                .map(|index| self.group_values[*index])
+                .collect();
 
-        let iter = izip!(
-            lhs_rows.iter(),
-            rhs_rows.iter(),
-            equal_to_results.iter(),
-        );
+            let nulls = match &self.nulls {
+                MaybeNullBufferBuilder::NoNulls { .. } => None,
+                MaybeNullBufferBuilder::Nulls(builder) => {
+                    let buffer = {
+                        let len = lhs_rows.len();
+                        let mut output_buffer = MutableBuffer::new_null(len);
+                        let output_slice = output_buffer.as_slice_mut();
 
-        for (idx_left, idx_right, is_valid) in iter {
-            if !*is_valid {
-                continue;
-            }
+                        lhs_rows.iter().enumerate().for_each(|(i, index)| {
+                            if builder.get_bit(*index) {
+                                bit_util::set_bit(output_slice, i);
+                            }
+                        });
 
-            if self.nulls.is_null(*idx_left) {
-                builder_left.append_null();
-            } else {
-                builder_left.append_value(self.group_values[*idx_left]);
-            }
+                        BooleanBuffer::new(output_buffer.into(), 0, lhs_rows.len())
+                    };
 
-            if array.is_null(*idx_right) {
-                builder_right.append_null();
-            } else {
-                builder_right.append_value(array.value(*idx_right));
-            }
-        }
+                    Some(NullBuffer::new(buffer)).filter(|n| n.null_count() > 0)
+                },
+            };
 
-        let arr_left = builder_left.finish();
-        let arr_right = builder_right.finish();
+            PrimitiveArray::new(values_buf, nulls)
+        };
+
+        let arr_right: PrimitiveArray<T> = {
+            let values_buf: ScalarBuffer<T::Native> = rhs_rows
+                .iter()
+                .map(|index| array.value(*index))
+                .collect();
+
+            let nulls = match array.nulls().filter(|n| n.null_count() > 0) {
+                Some(n) => {
+                    let buffer = {
+                        let len = rhs_rows.len();
+                        let mut output_buffer = MutableBuffer::new_null(len);
+                        let output_slice = output_buffer.as_slice_mut();
+
+                        rhs_rows.iter().enumerate().for_each(|(i, index)| {
+                            if n.inner().value(*index) {
+                                bit_util::set_bit(output_slice, i);
+                            }
+                        });
+
+                        BooleanBuffer::new(output_buffer.into(), 0, rhs_rows.len())
+                    };
+
+                    Some(NullBuffer::new(buffer)).filter(|n| n.null_count() > 0)
+                },
+                None => None,
+            };
+
+            PrimitiveArray::new(values_buf, nulls)
+        };
 
         let equal_arr = match NULLABLE {
             true => not_distinct(&arr_left, &arr_right),
