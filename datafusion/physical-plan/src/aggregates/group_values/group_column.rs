@@ -25,6 +25,7 @@ use arrow::array::PrimitiveArray;
 use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::buffer::ScalarBuffer;
+use arrow::compute::and;
 use arrow::datatypes::ByteArrayType;
 use arrow::datatypes::ByteViewType;
 use arrow::datatypes::DataType;
@@ -32,6 +33,7 @@ use arrow::datatypes::GenericBinaryType;
 use arrow_array::GenericByteArray;
 use arrow_array::GenericByteViewArray;
 use arrow_buffer::bit_util;
+use arrow_buffer::ArrowNativeType;
 use arrow_buffer::BooleanBuffer;
 use arrow_buffer::Buffer;
 use arrow_buffer::MutableBuffer;
@@ -169,14 +171,29 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
         equal_to_results: &mut [bool],
     ) {
         let array = array.as_primitive::<T>();
+        
+        let values_buf_left = take_primitive_native(
+            &self.group_values,
+            lhs_rows
+        );
 
-        let arr_left: PrimitiveArray<T> = {
-            let values_buf: ScalarBuffer<T::Native> = lhs_rows
-                .iter()
-                .map(|index| self.group_values[*index])
-                .collect();
+        let values_buf_right = take_primitive_native(
+            array.values(),
+            rhs_rows
+        );
 
-            let nulls = match &self.nulls {
+        let mut equal_arr = BooleanBuffer::collect_bool(
+            equal_to_results.len(),
+            |idx| unsafe {
+                let value_left = *values_buf_left.get_unchecked(idx);
+                let value_right = *values_buf_right.get_unchecked(idx);
+                value_left == value_right
+            }
+        );
+
+        // TODO: The NULLABLE case may have further optimization...
+        if NULLABLE {
+            let nulls_left = match &self.nulls {
                 MaybeNullBufferBuilder::NoNulls { .. } => None,
                 MaybeNullBufferBuilder::Nulls(builder) => {
                     let buffer = {
@@ -194,19 +211,10 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
                     };
 
                     Some(NullBuffer::new(buffer)).filter(|n| n.null_count() > 0)
-                },
+                }
             };
 
-            PrimitiveArray::new(values_buf, nulls)
-        };
-
-        let arr_right: PrimitiveArray<T> = {
-            let values_buf: ScalarBuffer<T::Native> = rhs_rows
-                .iter()
-                .map(|index| array.value(*index))
-                .collect();
-
-            let nulls = match array.nulls().filter(|n| n.null_count() > 0) {
+            let nulls_right = match array.nulls().filter(|n| n.null_count() > 0) {
                 Some(n) => {
                     let buffer = {
                         let len = rhs_rows.len();
@@ -227,36 +235,29 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
                 None => None,
             };
 
-            PrimitiveArray::new(values_buf, nulls)
-        };
+            equal_arr = match (nulls_left, nulls_right) {
+                (Some(nulls_left), Some(nulls_right)) => {
+                    let equal_nulls_or = !&(nulls_left.inner() | nulls_right.inner());
+                    let equal_nulls_xor = !&(nulls_left.inner() ^ nulls_right.inner());
 
-        let equal_arr: BooleanBuffer = match NULLABLE {
-            true => {
-                let equal_values: BooleanBuffer = (0..lhs_rows.len())
-                    .map(|idx| arr_left.value(idx) == arr_right.value(idx))
-                    .collect();
-                match (arr_left.nulls(), arr_right.nulls()) {
-                    (Some(nulls_left), Some(nulls_right)) => {
-                        let equal_nulls_or = !&(nulls_left.inner() | nulls_right.inner());
-                        let equal_nulls_xor = !&(nulls_left.inner() ^ nulls_right.inner());
-
-                        &(((&equal_nulls_or) | (&equal_values))) & (&equal_nulls_xor)
-                    }
-                    (Some(equal_nulls), None) | (None, Some(equal_nulls)) => {
-                        equal_nulls.inner() & (&equal_values)
-                    }
-                    (None, None) => equal_values,
+                    &(((&equal_nulls_or) | (&equal_arr))) & (&equal_nulls_xor)
                 }
-            }
-            false => {
-                (0..lhs_rows.len())
-                .map(|idx| arr_left.value(idx) == arr_right.value(idx))
-                .collect()
-            }
-        };
+                (Some(equal_nulls), None) | (None, Some(equal_nulls)) => {
+                    equal_nulls.inner() & (&equal_arr)
+                }
+                (None, None) => equal_arr,
+            };
+        }
 
-        equal_arr.iter().enumerate().for_each(|(idx, eq)| {
-            equal_to_results[idx] &= eq;
+        and(
+            &equal_to_results.to_vec().into(),
+            &equal_arr.into()
+        ).unwrap()
+        .values()
+        .iter()
+        .enumerate()
+        .for_each(|(idx, eq)| {
+            equal_to_results[idx] = eq;
         });
     }
 
@@ -342,6 +343,17 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
             first_n_nulls,
         ))
     }
+}
+
+#[inline(never)]
+fn take_primitive_native<T: ArrowNativeType>(
+    values: &[T],
+    indices: &[usize]
+) -> ScalarBuffer<T> {
+    indices
+    .iter()
+    .map(|index| values[*index])
+    .collect()
 }
 
 /// An implementation of [`GroupColumn`] for binary and utf8 types.
