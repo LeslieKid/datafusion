@@ -25,7 +25,6 @@ use arrow::array::PrimitiveArray;
 use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::buffer::ScalarBuffer;
-use arrow::compute::and;
 use arrow::datatypes::ByteArrayType;
 use arrow::datatypes::ByteViewType;
 use arrow::datatypes::DataType;
@@ -191,7 +190,6 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
             }
         );
 
-        // TODO: The NULLABLE case may have further optimization...
         if NULLABLE {
             let nulls_left = match &self.nulls {
                 MaybeNullBufferBuilder::NoNulls { .. } => None,
@@ -214,26 +212,7 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
                 }
             };
 
-            let nulls_right = match array.nulls().filter(|n| n.null_count() > 0) {
-                Some(n) => {
-                    let buffer = {
-                        let len = rhs_rows.len();
-                        let mut output_buffer = MutableBuffer::new_null(len);
-                        let output_slice = output_buffer.as_slice_mut();
-
-                        rhs_rows.iter().enumerate().for_each(|(i, index)| {
-                            if n.inner().value(*index) {
-                                bit_util::set_bit(output_slice, i);
-                            }
-                        });
-
-                        BooleanBuffer::new(output_buffer.into(), 0, rhs_rows.len())
-                    };
-
-                    Some(NullBuffer::new(buffer)).filter(|n| n.null_count() > 0)
-                },
-                None => None,
-            };
+            let nulls_right = take_nulls(array.nulls(), rhs_rows);
 
             equal_arr = match (nulls_left, nulls_right) {
                 (Some(nulls_left), Some(nulls_right)) => {
@@ -249,15 +228,8 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
             };
         }
 
-        and(
-            &equal_to_results.to_vec().into(),
-            &equal_arr.into()
-        ).unwrap()
-        .values()
-        .iter()
-        .enumerate()
-        .for_each(|(idx, eq)| {
-            equal_to_results[idx] = eq;
+        equal_arr.iter().enumerate().for_each(|(idx, eq)| {
+            equal_to_results[idx] &= eq;
         });
     }
 
@@ -354,6 +326,37 @@ fn take_primitive_native<T: ArrowNativeType>(
     .iter()
     .map(|index| values[*index])
     .collect()
+}
+
+#[inline(never)]
+fn take_nulls(
+    values: Option<&NullBuffer>,
+    indices: &[usize]
+) -> Option<NullBuffer> {
+    match values.filter(|n| n.null_count() > 0) {
+        Some(n) => {
+            let buffer = take_bits(n.inner(), indices);
+            Some(NullBuffer::new(buffer)).filter(|n| n.null_count() > 0)
+        }
+        None => None,
+    }
+}
+
+#[inline(never)]
+fn take_bits(
+    values: &BooleanBuffer,
+    indices: &[usize],
+) -> BooleanBuffer {
+    let len = indices.len();
+    let mut output_buffer = MutableBuffer::new_null(len);
+    let output_slice = output_buffer.as_slice_mut();
+
+    indices.iter().enumerate().for_each(|(i, index)| {
+        if values.value(*index) {
+            bit_util::set_bit(output_slice, i);
+        }
+    });
+    BooleanBuffer::new(output_buffer.into(), 0, indices.len())
 }
 
 /// An implementation of [`GroupColumn`] for binary and utf8 types.
