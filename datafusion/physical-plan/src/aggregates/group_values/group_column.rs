@@ -37,6 +37,8 @@ use arrow_buffer::BooleanBuffer;
 use arrow_buffer::Buffer;
 use arrow_buffer::MutableBuffer;
 use arrow_buffer::NullBuffer;
+use arrow_ord::cmp::eq;
+use arrow_ord::cmp::not_distinct;
 use datafusion_common::utils::proxy::VecAllocExt;
 use itertools::izip;
 
@@ -171,27 +173,12 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
     ) {
         let array = array.as_primitive::<T>();
         
-        let values_buf_left = take_primitive_native(
-            &self.group_values,
-            lhs_rows
-        );
-
-        let values_buf_right = take_primitive_native(
-            array.values(),
-            rhs_rows
-        );
-
-        let mut equal_arr = BooleanBuffer::collect_bool(
-            equal_to_results.len(),
-            |idx| unsafe {
-                let value_left = *values_buf_left.get_unchecked(idx);
-                let value_right = *values_buf_right.get_unchecked(idx);
-                value_left == value_right
-            }
-        );
-
-        if NULLABLE {
-            let nulls_left = match &self.nulls {
+        let arr_left: PrimitiveArray<T> = PrimitiveArray::new(
+            take_primitive_native(
+                &self.group_values,
+                lhs_rows
+            ),
+            match &self.nulls {
                 MaybeNullBufferBuilder::NoNulls { .. } => None,
                 MaybeNullBufferBuilder::Nulls(builder) => {
                     let buffer = {
@@ -210,25 +197,23 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
 
                     Some(NullBuffer::new(buffer)).filter(|n| n.null_count() > 0)
                 }
-            };
+            }
+        );
 
-            let nulls_right = take_nulls(array.nulls(), rhs_rows);
+        let arr_right: PrimitiveArray<T> = PrimitiveArray::new(
+            take_primitive_native(
+                array.values(),
+                rhs_rows
+            ),
+            take_nulls(array.nulls(), rhs_rows)
+        );
 
-            equal_arr = match (nulls_left, nulls_right) {
-                (Some(nulls_left), Some(nulls_right)) => {
-                    let equal_nulls_or = !&(nulls_left.inner() | nulls_right.inner());
-                    let equal_nulls_xor = !&(nulls_left.inner() ^ nulls_right.inner());
+        let equal_arr = match NULLABLE {
+            true => not_distinct(&arr_left, &arr_right),
+            false => eq(&arr_left, &arr_right)
+        }.unwrap();
 
-                    &(((&equal_nulls_or) | (&equal_arr))) & (&equal_nulls_xor)
-                }
-                (Some(equal_nulls), None) | (None, Some(equal_nulls)) => {
-                    equal_nulls.inner() & (&equal_arr)
-                }
-                (None, None) => equal_arr,
-            };
-        }
-
-        equal_arr.iter().enumerate().for_each(|(idx, eq)| {
+        equal_arr.values().iter().enumerate().for_each(|(idx, eq)| {
             equal_to_results[idx] &= eq;
         });
     }
