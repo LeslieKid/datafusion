@@ -173,6 +173,10 @@ impl<T: ArrowPrimitiveType, const NULLABLE: bool> GroupColumn
     ) {
         let array = array.as_primitive::<T>();
         
+        // Take values with corresponding indices and construct a new primitive array.
+        //
+        // Similar to the `take()` in arrow::compute::take and customize for this case to
+        // reduce unnecessary copy.
         let arr_left: PrimitiveArray<T> = PrimitiveArray::new(
             take_primitive_native(
                 &self.group_values,
